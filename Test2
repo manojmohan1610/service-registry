@@ -1,0 +1,530 @@
+<!-- pom.xml -->
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>2.7.5</version> <!-- Or any recent stable version -->
+        <relativePath/> <!-- lookup parent from repository -->
+    </parent>
+    <groupId>com.example</groupId>
+    <artifactId>multi-db-demo</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <name>multi-db-demo</name>
+    <description>Demo project for Spring Boot with multiple databases</description>
+    <properties>
+        <java.version>11</java.version>
+    </properties>
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        <!-- Spring Retry for resilient operations -->
+        <dependency>
+            <groupId>org.springframework.retry</groupId>
+            <artifactId>spring-retry</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-aspects</artifactId>
+        </dependency>
+        <!-- Primary DB Driver (e.g., PostgreSQL) -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <!-- Secondary DB Driver (e.g., MySQL) -->
+        <dependency>
+            <groupId>mysql</groupId>
+            <artifactId>mysql-connector-java</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+```properties
+# src/main/resources/application.properties
+
+# ----------------------------------------
+# PRIMARY DATABASE (PostgreSQL)
+# ----------------------------------------
+spring.datasource.primary.jdbc-url=jdbc:postgresql://localhost:5432/primary_db
+spring.datasource.primary.username=user
+spring.datasource.primary.password=password
+spring.datasource.primary.driver-class-name=org.postgresql.Driver
+spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.PostgreSQLDialect
+
+# HikariCP settings for Primary DB
+spring.datasource.primary.hikari.pool-name=PrimaryDB-HikariPool
+spring.datasource.primary.hikari.maximum-pool-size=10
+spring.datasource.primary.hikari.minimum-idle=5
+spring.datasource.primary.hikari.connection-timeout=30000 # 30 seconds
+spring.datasource.primary.hikari.idle-timeout=600000 # 10 minutes
+
+# ----------------------------------------
+# SECONDARY DATABASE (MySQL) - Lazy Connection
+# ----------------------------------------
+# We will configure this datasource to be created lazily.
+# The presence of these properties alone does not create the connection pool.
+spring.datasource.secondary.jdbc-url=jdbc:mysql://localhost:3306/secondary_db?useSSL=false
+spring.datasource.secondary.username=user
+spring.datasource.secondary.password=password
+spring.datasource.secondary.driver-class-name=com.mysql.cj.jdbc.Driver
+spring.jpa.properties.hibernate.dialect.secondary=org.hibernate.dialect.MySQL8Dialect
+
+# HikariCP settings for Secondary DB
+# This pool will be created on-demand.
+spring.datasource.secondary.hikari.pool-name=SecondaryDB-HikariPool
+spring.datasource.secondary.hikari.maximum-pool-size=5 # Smaller pool for infrequent use
+spring.datasource.secondary.hikari.minimum-idle=0 # Allow pool to shrink to zero
+spring.datasource.secondary.hikari.connection-timeout=30000 # 30 seconds
+# IMPORTANT: A short idle timeout will close unused connections, releasing resources from the secondary DB.
+spring.datasource.secondary.hikari.idle-timeout=120000 # 2 minutes
+spring.datasource.secondary.hikari.max-lifetime=900000 # 15 minutes
+
+# JPA Settings
+spring.jpa.hibernate.ddl-auto=update
+spring.jpa.show-sql=true
+```java
+// src/main/java/com/example/multidbdemo/MultiDbDemoApplication.java
+package com.example.multidbdemo;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.retry.annotation.EnableRetry;
+
+@SpringBootApplication
+@EnableRetry // Enable Spring's retry mechanism
+public class MultiDbDemoApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(MultiDbDemoApplication.class, args);
+    }
+
+}
+```java
+// src/main/java/com/example/multidbdemo/config/PrimaryDataSourceConfig.java
+package com.example.multidbdemo.config;
+
+import com.zaxxer.hikari.HikariDataSource;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.autoconfigure.jdbc.DataSourceProperties;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.orm.jpa.EntityManagerFactoryBuilder;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
+import org.springframework.orm.jpa.JpaTransactionManager;
+import org.springframework.orm.jpa.LocalContainerEntityManagerFactoryBean;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.annotation.EnableTransactionManagement;
+
+import javax.persistence.EntityManagerFactory;
+import javax.sql.DataSource;
+import java.util.HashMap;
+import java.util.Map;
+
+@Configuration
+@EnableTransactionManagement
+@EnableJpaRepositories(
+    basePackages = "com.example.multidbdemo.repository.primary", // Path to primary repositories
+    entityManagerFactoryRef = "primaryEntityManagerFactory",
+    transactionManagerRef = "primaryTransactionManager"
+)
+public class PrimaryDataSourceConfig {
+
+    /**
+     * Defines the properties for the primary data source from application.properties.
+     */
+    @Bean
+    @Primary
+    @ConfigurationProperties("spring.datasource.primary")
+    public DataSourceProperties primaryDataSourceProperties() {
+        return new DataSourceProperties();
+    }
+
+    /**
+     * Creates the primary DataSource bean using HikariCP.
+     * @param primaryDataSourceProperties The properties for the primary data source.
+     * @return The configured DataSource.
+     */
+    @Bean
+    @Primary
+    @ConfigurationProperties("spring.datasource.primary.hikari")
+    public DataSource primaryDataSource(DataSourceProperties primaryDataSourceProperties) {
+        return primaryDataSourceProperties.initializeDataSourceBuilder()
+                .type(HikariDataSource.class)
+                .build();
+    }
+
+    /**
+     * Creates the EntityManagerFactory for the primary data source.
+     * This factory is responsible for creating JPA EntityManagers.
+     */
+    @Bean
+    @Primary
+    public LocalContainerEntityManagerFactoryBean primaryEntityManagerFactory(
+            EntityManagerFactoryBuilder builder,
+            @Qualifier("primaryDataSource") DataSource dataSource) {
+        return builder
+                .dataSource(dataSource)
+                .packages("com.example.multidbdemo.domain.primary") // Path to primary entities
+                .persistenceUnit("primary")
+                .build();
+    }
+
+    /**
+     * Creates the transaction manager for the primary data source.
+     * This manager will handle transactions for operations on the primary DB.
+     */
+    @Bean
+    @Primary
+    public PlatformTransactionManager primaryTransactionManager(
+            @Qualifier("primaryEntityManagerFactory") EntityManagerFactory entityManagerFactory) {
+        return new JpaTransactionManager(entityManagerFactory);
+    }
+}
+```java
+// src/main/java/com/example/multidbdemo/config/SecondaryDataSourceConfig.java
+package com.example.multidbdemo.config;
+
+import com.zaxxer.hikari.HikariDataSource;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.autoconfigure.jdbc.DataSourceProperties;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.orm.jpa.EntityManagerFactoryBuilder;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
+import org.springframework.orm.jpa.JpaTransactionManager;
+import org.springframework.orm.jpa.LocalContainerEntityManagerFactoryBean;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.annotation.EnableTransactionManagement;
+
+import javax.persistence.EntityManagerFactory;
+import javax.sql.DataSource;
+import java.util.HashMap;
+import java.util.Map;
+
+@Configuration
+@EnableTransactionManagement
+@EnableJpaRepositories(
+    basePackages = "com.example.multidbdemo.repository.secondary", // Path to secondary repositories
+    entityManagerFactoryRef = "secondaryEntityManagerFactory",
+    transactionManagerRef = "secondaryTransactionManager"
+)
+public class SecondaryDataSourceConfig {
+
+    /**
+     * Defines the properties for the secondary data source.
+     */
+    @Bean
+    @ConfigurationProperties("spring.datasource.secondary")
+    public DataSourceProperties secondaryDataSourceProperties() {
+        return new DataSourceProperties();
+    }
+
+    /**
+     * Creates the secondary DataSource bean.
+     * IMPORTANT: The @Lazy annotation ensures that this bean (and thus the connection pool)
+     * is not created at application startup. It will only be instantiated the first time
+     * it's requested from the context, i.e., when a service that uses it is called.
+     */
+    @Bean
+    @Lazy
+    @ConfigurationProperties("spring.datasource.secondary.hikari")
+    public DataSource secondaryDataSource(DataSourceProperties secondaryDataSourceProperties) {
+        System.out.println("----------- LAZILY CREATING SECONDARY DATASOURCE -----------");
+        return secondaryDataSourceProperties.initializeDataSourceBuilder()
+                .type(HikariDataSource.class)
+                .build();
+    }
+
+    /**
+     * Creates the EntityManagerFactory for the secondary data source.
+     * Also marked as @Lazy to follow the datasource's initialization pattern.
+     */h
+    @Bean
+    @Lazy
+    public LocalContainerEntityManagerFactoryBean secondaryEntityManagerFactory(
+            EntityManagerFactoryBuilder builder,
+            @Qualifier("secondaryDataSource") DataSource dataSource) {
+        
+        Map<String, String> jpaProperties = new HashMap<>();
+        jpaProperties.put("hibernate.dialect", "org.hibernate.dialect.MySQL8Dialect");
+
+        return builder
+                .dataSource(dataSource)
+                .packages("com.example.multidbdemo.domain.secondary") // Path to secondary entities
+                .persistenceUnit("secondary")
+                .properties(jpaProperties)
+                .build();
+    }
+
+    /**
+     * Creates the transaction manager for the secondary data source.
+     * Also marked as @Lazy.
+     */
+    @Bean
+    @Lazy
+    public PlatformTransactionManager secondaryTransactionManager(
+            @Qualifier("secondaryEntityManagerFactory") EntityManagerFactory entityManagerFactory) {
+        return new JpaTransactionManager(entityManagerFactory);
+    }
+}
+```java
+// src/main/java/com/example/multidbdemo/domain/primary/PrimaryUser.java
+package com.example.multidbdemo.domain.primary;
+
+import javax.persistence.*;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "users")
+public class PrimaryUser {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String name;
+    private String status;
+    private LocalDateTime lastUpdated;
+
+    // Getters and Setters
+    public Long getId() { return id; }
+    public void setId(Long id) { this.id = id; }
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+    public String getStatus() { return status; }
+    public void setStatus(String status) { this.status = status; }
+    public LocalDateTime getLastUpdated() { return lastUpdated; }
+    public void setLastUpdated(LocalDateTime lastUpdated) { this.lastUpdated = lastUpdated; }
+}
+```java
+// src/main/java/com/example/multidbdemo/domain/secondary/SecondaryUserLog.java
+package com.example.multidbdemo.domain.secondary;
+
+import javax.persistence.*;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "user_logs")
+public class SecondaryUserLog {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private Long primaryUserId;
+    private String action;
+    private LocalDateTime logTimestamp;
+
+    // Constructors, Getters, and Setters
+    public SecondaryUserLog() {}
+
+    public SecondaryUserLog(Long primaryUserId, String action, LocalDateTime logTimestamp) {
+        this.primaryUserId = primaryUserId;
+        this.action = action;
+        this.logTimestamp = logTimestamp;
+    }
+
+    public Long getId() { return id; }
+    public void setId(Long id) { this.id = id; }
+    public Long getPrimaryUserId() { return primaryUserId; }
+    public void setPrimaryUserId(Long primaryUserId) { this.primaryUserId = primaryUserId; }
+    public String getAction() { return action; }
+    public void setAction(String action) { this.action = action; }
+    public LocalDateTime getLogTimestamp() { return logTimestamp; }
+    public void setLogTimestamp(LocalDateTime logTimestamp) { this.logTimestamp = logTimestamp; }
+}
+```java
+// src/main/java/com/example/multidbdemo/repository/primary/PrimaryUserRepository.java
+package com.example.multidbdemo.repository.primary;
+
+import com.example.multidbdemo.domain.primary.PrimaryUser;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface PrimaryUserRepository extends JpaRepository<PrimaryUser, Long> {
+}
+```java
+// src/main/java/com/example/multidbdemo/repository/secondary/SecondaryUserLogRepository.java
+package com.example.multidbdemo.repository.secondary;
+
+import com.example.multidbdemo.domain.secondary.SecondaryUserLog;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface SecondaryUserLogRepository extends JpaRepository<SecondaryUserLog, Long> {
+}
+```java
+// src/main/java/com/example/multidbdemo/service/UpdateService.java
+package com.example.multidbdemo.service;
+
+import com.example.multidbdemo.domain.primary.PrimaryUser;
+import com.example.multidbdemo.domain.secondary.SecondaryUserLog;
+import com.example.multidbdemo.repository.primary.PrimaryUserRepository;
+import com.example.multidbdemo.repository.secondary.SecondaryUserLogRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.retry.annotation.Backoff;
+import org.springframework.retry.annotation.Recover;
+import org.springframework.retry.annotation.Retryable;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.SQLException;
+import java.time.LocalDateTime;
+
+@Service
+public class UpdateService {
+
+    private static final Logger logger = LoggerFactory.getLogger(UpdateService.class);
+
+    private final PrimaryUserRepository primaryUserRepository;
+    // Autowiring this repository will trigger the lazy initialization of the secondary datasource
+    private final SecondaryUserLogRepository secondaryUserLogRepository;
+
+    @Autowired
+    public UpdateService(PrimaryUserRepository primaryUserRepository, SecondaryUserLogRepository secondaryUserLogRepository) {
+        this.primaryUserRepository = primaryUserRepository;
+        this.secondaryUserLogRepository = secondaryUserLogRepository;
+    }
+
+    /**
+     * Updates the primary user. This operation is managed by the primary transaction manager.
+     */
+    @Transactional("primaryTransactionManager")
+    public PrimaryUser updateUser(Long userId, String status) {
+        PrimaryUser user = primaryUserRepository.findById(userId)
+                .orElseThrow(() -> new RuntimeException("User not found with id: " + userId));
+        user.setStatus(status);
+        user.setLastUpdated(LocalDateTime.now());
+        return primaryUserRepository.save(user);
+    }
+
+    /**
+     * Creates a log in the secondary database. This operation is managed by the secondary transaction manager.
+     * If this method fails, the transaction in updateUser will be rolled back.
+     */
+    @Transactional("secondaryTransactionManager")
+    public void logUserUpdate(Long userId, String status) {
+        // Uncomment the following line to test a failure in the secondary DB operation
+        // if (true) { throw new RuntimeException("Simulating secondary DB failure!"); }
+        secondaryUserLogRepository.save(new SecondaryUserLog(userId, "STATUS_UPDATE: " + status, LocalDateTime.now()));
+    }
+
+    /**
+     * Orchestrator method with retry logic.
+     * It will retry up to 3 times on any SQLException with a 2-second delay.
+     * This method itself is not transactional, but it calls methods that are.
+     * This ensures that each database operation has its own atomic transaction.
+     */
+    @Retryable(
+        value = { SQLException.class, RuntimeException.class }, // Retry on these exceptions
+        maxAttempts = 3,
+        backoff = @Backoff(delay = 2000) // 2-second delay between retries
+    )
+    public void updateUserAndLog(Long userId, String status) {
+        logger.info("Attempting to update user {} and log the action.", userId);
+        
+        // Step 1: Update Primary DB
+        PrimaryUser updatedUser = updateUser(userId, status);
+        
+        // Step 2: Update Secondary DB
+        logUserUpdate(updatedUser.getId(), status);
+
+        logger.info("Successfully updated user {} and logged the action.", userId);
+    }
+
+    /**
+     * This is the recovery method called by Spring Retry if all retry attempts fail.
+     * It allows you to handle the failure gracefully, e.g., by logging a critical error
+     * or sending a notification.
+     */
+    @Recover
+    public void recover(Exception e, Long userId, String status) {
+        logger.error("All retry attempts failed for updating user {}. Final exception: {}", userId, e.getMessage());
+        // Here you could add logic to notify an admin, or queue the update for a later attempt.
+    }
+    
+    /**
+     * A simple service method that only uses the primary database.
+     */
+    @Transactional(readOnly = true, transactionManager = "primaryTransactionManager")
+    public PrimaryUser findUser(Long userId) {
+        return primaryUserRepository.findById(userId).orElse(null);
+    }
+}
+```java
+// src/main/java/com/example/multidbdemo/controller/UserController.java
+package com.example.multidbdemo.controller;
+
+import com.example.multidbdemo.domain.primary.PrimaryUser;
+import com.example.multidbdemo.service.UpdateService;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/users")
+public class UserController {
+
+    private final UpdateService updateService;
+
+    public UserController(UpdateService updateService) {
+        this.updateService = updateService;
+    }
+
+    /**
+     * This endpoint only interacts with the primary database.
+     * It will NOT trigger the creation of the secondary database connection pool.
+     */
+    @GetMapping("/{id}")
+    public ResponseEntity<PrimaryUser> getUserById(@PathVariable Long id) {
+        PrimaryUser user = updateService.findUser(id);
+        if (user != null) {
+            return ResponseEntity.ok(user);
+        }
+        return ResponseEntity.notFound().build();
+    }
+
+    /**
+     * IMPORTANT: This is the endpoint that uses the secondary database.
+     * The first time this endpoint is called, it will trigger the @Lazy creation
+     * of the secondary DataSource, EntityManagerFactory, and TransactionManager.
+     * Subsequent calls will use the existing connection pool.
+     */
+    @PostMapping("/{id}/update-status")
+    public ResponseEntity<String> updateUserStatus(@PathVariable Long id, @RequestParam String status) {
+        try {
+            updateService.updateUserAndLog(id, status);
+            return ResponseEntity.ok("User status updated and logged successfully.");
+        } catch (Exception e) {
+            // This will catch the exception after all retries have failed.
+            return ResponseEntity.status(500).body("Failed to update user status after multiple retries: " + e.getMessage());
+        }
+    }
+}
